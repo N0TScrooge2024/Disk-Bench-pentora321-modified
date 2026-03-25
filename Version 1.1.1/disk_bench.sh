@@ -1,5 +1,8 @@
 #!/bin/bash
 
+echo DO NOT USE THIS VERSION
+exit
+
 # 🎨 تعریف رنگ‌ها برای نمایش زیباتر
 RED='\033[0;31m'
 GREEN='\033[0;32m'
