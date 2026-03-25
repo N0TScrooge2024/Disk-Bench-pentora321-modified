@@ -3,14 +3,11 @@
 # ============================================================
 # Disk Benchmark Script
 # Original by MOHAMMAD REFAEI (modified)
-# Version 2.3
+# Version 2.5
 #
-# Changes in version 2.3:
-# - If tmux is available but script is not running inside tmux,
-#   automatically re-run itself in a new tmux session.
-# - Fixed pv usage: pv is now executed only once per test,
-#   its stderr is captured and parsed for speed.
-# - Improved error handling for pv and tmux.
+# Changes in version 2.5:
+# - Changed iostat output to human-readable format (--human) with 10-second interval.
+# - This provides cleaner, easier-to-read disk statistics during tests.
 # ============================================================
 
 # Set locale to C for predictable command output
@@ -227,15 +224,16 @@ check_disk_in_use() {
 # Start iostat in a tmux pane if possible
 start_iostat_pane() {
     if [[ -n "$TMUX" ]] && command -v tmux &>/dev/null; then
-        echo -e "${GREEN}Running inside tmux. Splitting window for iostat...${RESET}"
-        # Create a new pane to the right, 40% width, get its ID
-        IOSTAT_PANE_ID=$(tmux split-window -h -l 40% -P -F "#{pane_id}")
+        echo -e "${GREEN}Running inside tmux. Splitting window horizontally for iostat...${RESET}"
+        # Create a new pane below (horizontal split) with 40% height,
+        # do not switch focus to it (-d), and capture its pane ID
+        IOSTAT_PANE_ID=$(tmux split-window -v -l 40% -d -P -F "#{pane_id}")
         if [[ -z "$IOSTAT_PANE_ID" ]]; then
             echo -e "${YELLOW}Failed to create tmux pane. Continuing without iostat.${RESET}"
             return 1
         fi
-        # Send iostat command to the new pane
-        tmux send-keys -t "$IOSTAT_PANE_ID" "iostat -x -m $DISK 1; echo 'Press any key to close...'; read" Enter
+        # Send iostat command with human-readable output and 10-second interval
+        tmux send-keys -t "$IOSTAT_PANE_ID" "iostat --human $DISK 10; echo 'Press any key to close...'; read" Enter
         sleep 1  # give iostat a moment to start
         return 0
     else
