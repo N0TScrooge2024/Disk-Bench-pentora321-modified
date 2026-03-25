@@ -3,15 +3,14 @@
 # ============================================================
 # Disk Benchmark Script
 # Original by MOHAMMAD REFAEI (modified)
-# Version 2.1
+# Version 2.3
 #
-# Changes in version 2.1:
-# - Added system disk detection and warning
-# - Support 'full' option to test entire disk capacity
-# - Improved partition detection for NVMe and regular disks
-# - Added LC_ALL=C for consistent output parsing
-# - Enhanced error checking for parted commands
-# - Verify that selected device is a whole disk, not a partition
+# Changes in version 2.3:
+# - If tmux is available but script is not running inside tmux,
+#   automatically re-run itself in a new tmux session.
+# - Fixed pv usage: pv is now executed only once per test,
+#   its stderr is captured and parsed for speed.
+# - Improved error handling for pv and tmux.
 # ============================================================
 
 # Set locale to C for predictable command output
@@ -40,6 +39,11 @@ DD_COUNT=""           # Number of blocks (will be computed from GB input)
 PARTITION_PATH=""
 CLEANUP_NEEDED=false
 
+# Flags for optional tools
+USE_PV=false
+PV_SUPPORTS_DIRECT=false
+IOSTAT_PANE_ID=""
+
 # ------------------------------------------------------------------
 # Helper functions
 # ------------------------------------------------------------------
@@ -63,6 +67,21 @@ check_dependencies() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${RED}Missing required commands: ${missing[*]}${RESET}"
         exit 1
+    fi
+
+    # Check for optional pv
+    if command -v pv &>/dev/null; then
+        USE_PV=true
+        # Check if pv supports direct I/O (-D)
+        if pv -D /dev/null </dev/null 2>/dev/null; then
+            PV_SUPPORTS_DIRECT=true
+            echo -e "${GREEN}PV found and supports direct I/O. Will use pv for progress.${RESET}"
+        else
+            echo -e "${YELLOW}PV found but does NOT support direct I/O. Falling back to dd.${RESET}"
+            USE_PV=false
+        fi
+    else
+        echo -e "${YELLOW}PV not found. Using dd for I/O tests.${RESET}"
     fi
 }
 
@@ -205,6 +224,152 @@ check_disk_in_use() {
     fi
 }
 
+# Start iostat in a tmux pane if possible
+start_iostat_pane() {
+    if [[ -n "$TMUX" ]] && command -v tmux &>/dev/null; then
+        echo -e "${GREEN}Running inside tmux. Splitting window for iostat...${RESET}"
+        # Create a new pane to the right, 40% width, get its ID
+        IOSTAT_PANE_ID=$(tmux split-window -h -l 40% -P -F "#{pane_id}")
+        if [[ -z "$IOSTAT_PANE_ID" ]]; then
+            echo -e "${YELLOW}Failed to create tmux pane. Continuing without iostat.${RESET}"
+            return 1
+        fi
+        # Send iostat command to the new pane
+        tmux send-keys -t "$IOSTAT_PANE_ID" "iostat -x -m $DISK 1; echo 'Press any key to close...'; read" Enter
+        sleep 1  # give iostat a moment to start
+        return 0
+    else
+        echo -e "${YELLOW}Not running inside tmux or tmux not available. Skipping iostat monitoring.${RESET}"
+        return 1
+    fi
+}
+
+# Stop iostat pane if it was started
+stop_iostat_pane() {
+    if [[ -n "$IOSTAT_PANE_ID" ]] && command -v tmux &>/dev/null; then
+        tmux kill-pane -t "$IOSTAT_PANE_ID" 2>/dev/null
+        IOSTAT_PANE_ID=""
+    fi
+}
+
+# Perform write test using either dd or pv
+run_write_test() {
+    local test_file="$1"
+    local count="$2"
+    local block_size_mb="$3"
+    local bytes=$((count * block_size_mb * 1024 * 1024))
+
+    echo -e "${BOLD}${CYAN}Running write test...${RESET}"
+    if [[ "$USE_PV" == true ]] && [[ "$PV_SUPPORTS_DIRECT" == true ]]; then
+        # Use pv with direct I/O, capture stderr for speed parsing
+        local pv_output
+        pv_output=$(pv -f -W -s "$bytes" -D "/dev/$DISK" /dev/zero > "$test_file" 2>&1)
+        local ret=$?
+        if [[ $ret -eq 0 ]]; then
+            echo -e "${GREEN}Write test completed with pv.${RESET}"
+        else
+            echo -e "${RED}Write test failed (pv).${RESET}"
+            return 1
+        fi
+        # Parse speed from pv's stderr (last line)
+        write_speed=$(echo "$pv_output" | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?[[:space:]]*[KMGT]?B/s')
+        [[ -z "$write_speed" ]] && write_speed="(could not parse)"
+        echo -e "${GREEN}Write speed (pv): $write_speed${RESET}"
+    else
+        # Use dd with direct I/O
+        dd if=/dev/zero of="$test_file" bs=${block_size_mb}M count=$count oflag=direct status=progress 2> dd_write.log
+        local ret=$?
+        if [[ $ret -ne 0 ]]; then
+            echo -e "${RED}Write test failed (dd). Check dd_write.log${RESET}"
+            return 1
+        fi
+        write_speed=$(grep -E -o '[0-9]+(\.[0-9]+)? [KMG]?B/s' dd_write.log | tail -1)
+        [[ -z "$write_speed" ]] && write_speed="(could not parse)"
+        echo -e "${GREEN}Write speed (dd): $write_speed${RESET}"
+        rm -f dd_write.log
+    fi
+    return 0
+}
+
+# Perform read test using either dd or pv
+run_read_test() {
+    local test_file="$1"
+    local count="$2"
+    local block_size_mb="$3"
+    local bytes=$((count * block_size_mb * 1024 * 1024))
+
+    echo -e "${BOLD}${CYAN}Running read test...${RESET}"
+    if [[ "$USE_PV" == true ]] && [[ "$PV_SUPPORTS_DIRECT" == true ]]; then
+        # Use pv with direct I/O, capture stderr for speed parsing
+        local pv_output
+        pv_output=$(pv -f -W -s "$bytes" -D "$test_file" "$test_file" > /dev/null 2>&1)
+        local ret=$?
+        if [[ $ret -eq 0 ]]; then
+            echo -e "${GREEN}Read test completed with pv.${RESET}"
+        else
+            echo -e "${RED}Read test failed (pv).${RESET}"
+            return 1
+        fi
+        # Parse speed from pv's stderr (last line)
+        read_speed=$(echo "$pv_output" | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?[[:space:]]*[KMGT]?B/s')
+        [[ -z "$read_speed" ]] && read_speed="(could not parse)"
+        echo -e "${GREEN}Read speed (pv): $read_speed${RESET}"
+    else
+        # Use dd with direct I/O
+        dd if="$test_file" of=/dev/null bs=${block_size_mb}M iflag=direct status=progress 2> dd_read.log
+        local ret=$?
+        if [[ $ret -ne 0 ]]; then
+            echo -e "${RED}Read test failed (dd). Check dd_read.log${RESET}"
+            return 1
+        fi
+        read_speed=$(grep -E -o '[0-9]+(\.[0-9]+)? [KMG]?B/s' dd_read.log | tail -1)
+        [[ -z "$read_speed" ]] && read_speed="(could not parse)"
+        echo -e "${GREEN}Read speed (dd): $read_speed${RESET}"
+        rm -f dd_read.log
+    fi
+    return 0
+}
+
+# Run DD test (sequential write/read)
+run_dd_test() {
+    # Start iostat pane if possible
+    start_iostat_pane
+
+    # Perform write test
+    if ! run_write_test "$TEST_FILE" "$DD_COUNT" "$DD_BLOCK_SIZE_MB"; then
+        stop_iostat_pane
+        exit 1
+    fi
+
+    # Perform read test
+    if ! run_read_test "$TEST_FILE" "$DD_COUNT" "$DD_BLOCK_SIZE_MB"; then
+        stop_iostat_pane
+        exit 1
+    fi
+
+    echo -e "\n${GREEN}${BOLD}DD Test Results:${RESET}"
+    echo -e "  ${YELLOW}Write speed:${RESET} $write_speed"
+    echo -e "  ${YELLOW}Read speed:${RESET} $read_speed"
+
+    # Stop iostat pane
+    stop_iostat_pane
+}
+
+# Run hdparm test (non-destructive, works on the raw disk)
+run_hdparm_test() {
+    echo -e "${BOLD}${CYAN}Running hdparm test on /dev/$DISK...${RESET}"
+    hdparm -Tt "/dev/$DISK" | tee hdparm_output.log
+
+    cached_speed=$(grep "Timing cached reads" hdparm_output.log | awk '{print $(NF-1), $NF}')
+    buffered_speed=$(grep "Timing buffered disk reads" hdparm_output.log | awk '{print $(NF-1), $NF}')
+
+    echo -e "\n${GREEN}${BOLD}hdparm Test Results:${RESET}"
+    echo -e "  ${YELLOW}Cached reads:${RESET} $cached_speed"
+    echo -e "  ${YELLOW}Buffered reads:${RESET} $buffered_speed"
+
+    rm -f hdparm_output.log
+}
+
 # Partition and format the disk (create one ext4 partition)
 partition_and_format() {
     echo -e "${BOLD}${CYAN}Preparing disk /dev/$DISK...${RESET}"
@@ -253,61 +418,6 @@ partition_and_format() {
     echo -e "${GREEN}Partition mounted at $MOUNT_POINT${RESET}"
 }
 
-# Run DD test (sequential write/read)
-run_dd_test() {
-    echo -e "${BOLD}${CYAN}Running DD write test...${RESET}"
-    # Write: use direct I/O to bypass cache, block size 1M, count calculated
-    dd if=/dev/zero of="$TEST_FILE" bs=${DD_BLOCK_SIZE_MB}M count=$DD_COUNT oflag=direct status=progress 2> dd_write.log
-
-    # Check if dd succeeded
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}DD write test failed. Check dd_write.log${RESET}"
-        exit 1
-    fi
-
-    # Extract write speed from log (last line containing speed)
-    write_speed=$(grep -E -o '[0-9]+(\.[0-9]+)? [KMG]?B/s' dd_write.log | tail -1)
-    if [[ -z "$write_speed" ]]; then
-        write_speed="(could not parse)"
-    fi
-
-    echo -e "${BOLD}${CYAN}Running DD read test...${RESET}"
-    # Read: use direct I/O to bypass cache
-    dd if="$TEST_FILE" of=/dev/null bs=${DD_BLOCK_SIZE_MB}M iflag=direct status=progress 2> dd_read.log
-
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}DD read test failed. Check dd_read.log${RESET}"
-        exit 1
-    fi
-
-    read_speed=$(grep -E -o '[0-9]+(\.[0-9]+)? [KMG]?B/s' dd_read.log | tail -1)
-    if [[ -z "$read_speed" ]]; then
-        read_speed="(could not parse)"
-    fi
-
-    echo -e "\n${GREEN}${BOLD}DD Test Results:${RESET}"
-    echo -e "  ${YELLOW}Write speed:${RESET} $write_speed"
-    echo -e "  ${YELLOW}Read speed:${RESET} $read_speed"
-
-    # Clean up temporary logs
-    rm -f dd_write.log dd_read.log
-}
-
-# Run hdparm test (non-destructive, works on the raw disk)
-run_hdparm_test() {
-    echo -e "${BOLD}${CYAN}Running hdparm test on /dev/$DISK...${RESET}"
-    hdparm -Tt "/dev/$DISK" | tee hdparm_output.log
-
-    cached_speed=$(grep "Timing cached reads" hdparm_output.log | awk '{print $(NF-1), $NF}')
-    buffered_speed=$(grep "Timing buffered disk reads" hdparm_output.log | awk '{print $(NF-1), $NF}')
-
-    echo -e "\n${GREEN}${BOLD}hdparm Test Results:${RESET}"
-    echo -e "  ${YELLOW}Cached reads:${RESET} $cached_speed"
-    echo -e "  ${YELLOW}Buffered reads:${RESET} $buffered_speed"
-
-    rm -f hdparm_output.log
-}
-
 # Cleanup: unmount, remove mount point, wipe disk (if we created a partition)
 cleanup_and_exit() {
     if [[ "$CLEANUP_NEEDED" == true ]]; then
@@ -323,6 +433,8 @@ cleanup_and_exit() {
 
         echo -e "${GREEN}Cleanup complete. Disk /dev/$DISK is now empty.${RESET}"
     fi
+    # Ensure iostat pane is killed if still running
+    stop_iostat_pane
 }
 
 # ------------------------------------------------------------------
@@ -330,6 +442,15 @@ cleanup_and_exit() {
 # ------------------------------------------------------------------
 check_root
 check_dependencies
+
+# If tmux is available and we are NOT already inside tmux, re-run inside a new tmux session
+if command -v tmux &>/dev/null && [[ -z "$TMUX" ]]; then
+    echo -e "${GREEN}tmux is available. Re-launching script inside tmux for iostat monitoring...${RESET}"
+    exec tmux new-session "$0"
+    # exec replaces the current process, so the script will not continue here
+fi
+
+# If we are inside tmux (TMUX is set) or tmux not available, continue normally
 get_user_inputs
 
 case "$TEST_CHOICE" in
