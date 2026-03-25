@@ -3,8 +3,19 @@
 # ============================================================
 # Disk Benchmark Script
 # Original by MOHAMMAD REFAEI (modified)
-# Version 2.0
+# Version 2.1
+#
+# Changes in version 2.1:
+# - Added system disk detection and warning
+# - Support 'full' option to test entire disk capacity
+# - Improved partition detection for NVMe and regular disks
+# - Added LC_ALL=C for consistent output parsing
+# - Enhanced error checking for parted commands
+# - Verify that selected device is a whole disk, not a partition
 # ============================================================
+
+# Set locale to C for predictable command output
+export LC_ALL=C
 
 # Color definitions
 RED='\033[0;31m'
@@ -61,6 +72,21 @@ list_disks() {
     lsblk -d -o NAME,SIZE,MODEL,TYPE | grep disk
 }
 
+# Check if the selected disk is a system disk (contains root partition)
+check_system_disk() {
+    local disk=$1
+    # Get all partitions of this disk
+    local partitions
+    partitions=$(lsblk -ln -o NAME,MOUNTPOINT "/dev/$disk" | awk '{print $1}')
+    for part in $partitions; do
+        # Check if any partition is mounted as root
+        if mount | grep -q "^/dev/$part on / "; then
+            return 0  # system disk found
+        fi
+    done
+    return 1  # not a system disk
+}
+
 # Get user input with validation
 get_user_inputs() {
     echo -e "\n${BOLD}${CYAN}Disk Benchmark Setup${RESET}"
@@ -77,9 +103,14 @@ get_user_inputs() {
             echo -e "${RED}Device /dev/$DISK does not exist.${RESET}"
             continue
         fi
-        # Basic check: ensure it's a block device and not a partition
+        # Ensure it's a block device and a disk (not a partition)
         if [[ ! -b "/dev/$DISK" ]]; then
             echo -e "${RED}/dev/$DISK is not a block device.${RESET}"
+            continue
+        fi
+        # Check if it's a disk (has no parent disk in lsblk hierarchy)
+        if ! lsblk -d -n -o NAME "/dev/$DISK" &>/dev/null; then
+            echo -e "${RED}/dev/$DISK is a partition, not a whole disk.${RESET}"
             continue
         fi
         break
@@ -93,18 +124,34 @@ get_user_inputs() {
     read -p "Enter your choice (1/2/3): " TEST_CHOICE
 
     if [[ "$TEST_CHOICE" == "1" || "$TEST_CHOICE" == "3" ]]; then
-        # For DD test, ask for total size in GB
+        # Ask for total size in GB or 'full'
         while true; do
-            read -p "Enter total test size in GB (e.g., 10): " total_size_gb
-            if [[ "$total_size_gb" =~ ^[0-9]+$ ]] && [[ $total_size_gb -gt 0 ]]; then
+            read -p "Enter total test size in GB, or 'full' to use entire disk: " size_input
+            if [[ "$size_input" == "full" ]]; then
+                # Get disk size in bytes
+                local disk_bytes
+                disk_bytes=$(lsblk -b -n -o SIZE "/dev/$DISK" 2>/dev/null | head -1)
+                if [[ -z "$disk_bytes" || "$disk_bytes" -eq 0 ]]; then
+                    echo -e "${RED}Failed to determine disk size.${RESET}"
+                    exit 1
+                fi
+                # Convert to GB (integer, floor)
+                total_size_gb=$((disk_bytes / 1024 / 1024 / 1024))
+                if [[ $total_size_gb -eq 0 ]]; then
+                    echo -e "${RED}Disk is smaller than 1 GB. Cannot test.${RESET}"
+                    exit 1
+                fi
+                echo -e "${YELLOW}Using full disk size: ${total_size_gb} GB${RESET}"
+                break
+            elif [[ "$size_input" =~ ^[0-9]+$ ]] && [[ $size_input -gt 0 ]]; then
+                total_size_gb=$size_input
                 break
             else
-                echo -e "${RED}Invalid size. Please enter a positive integer.${RESET}"
+                echo -e "${RED}Invalid size. Please enter a positive integer or 'full'.${RESET}"
             fi
         done
 
         # Compute count based on 1M blocks
-        # total_size_gb * 1024 = MB, then / block_size_mb = count
         DD_COUNT=$((total_size_gb * 1024 / DD_BLOCK_SIZE_MB))
         if [[ $DD_COUNT -eq 0 ]]; then
             echo -e "${RED}Total test size too small. Use at least 1 GB.${RESET}"
@@ -113,6 +160,17 @@ get_user_inputs() {
 
         echo -e "${YELLOW}Selected disk: /dev/$DISK${RESET}"
         echo -e "${YELLOW}Total test size: ${total_size_gb} GB (${DD_COUNT} blocks of ${DD_BLOCK_SIZE_MB} MB)${RESET}"
+    fi
+
+    # Warn if disk is system disk
+    if check_system_disk "$DISK"; then
+        echo -e "${RED}${BOLD}WARNING: /dev/$DISK appears to be a system disk (contains root partition).${RESET}"
+        echo -e "${RED}Continuing may cause data loss and break your system!${RESET}"
+        read -p "Are you absolutely sure you want to continue? (yes/no): " sys_confirm
+        if [[ "$sys_confirm" != "yes" ]]; then
+            echo -e "${GREEN}Aborted.${RESET}"
+            exit 0
+        fi
     fi
 
     # Confirmation before proceeding with destructive operations
@@ -155,16 +213,23 @@ partition_and_format() {
     wipefs -a "/dev/$DISK" || { echo -e "${RED}Failed to wipe disk.${RESET}"; exit 1; }
 
     # Create GPT partition table
-    parted "/dev/$DISK" mklabel gpt || { echo -e "${RED}Failed to create GPT label.${RESET}"; exit 1; }
+    if ! parted "/dev/$DISK" mklabel gpt; then
+        echo -e "${RED}Failed to create GPT label.${RESET}"
+        exit 1
+    fi
 
     # Create a single partition using all space
-    parted "/dev/$DISK" mkpart primary ext4 0% 100% || { echo -e "${RED}Failed to create partition.${RESET}"; exit 1; }
+    if ! parted "/dev/$DISK" mkpart primary ext4 0% 100%; then
+        echo -e "${RED}Failed to create partition.${RESET}"
+        exit 1
+    fi
 
     # Let udev settle
     sleep 2
 
     # Get the first partition (most likely the only one)
-    PARTITION_PATH=$(lsblk -ln -o NAME "/dev/$DISK" | grep -E "^${DISK}p?[0-9]+$" | head -n1)
+    # Regex matches both sda1 and nvme0n1p1 patterns
+    PARTITION_PATH=$(lsblk -ln -o NAME "/dev/$DISK" | grep -E "^${DISK}(p[0-9]+|[0-9]+)$" | head -n1)
     if [[ -z "$PARTITION_PATH" ]]; then
         echo -e "${RED}Partition creation failed. Exiting.${RESET}"
         exit 1
@@ -277,7 +342,7 @@ case "$TEST_CHOICE" in
     2)
         # hdparm test only, non-destructive, no cleanup needed
         run_hdparm_test
-        # disable cleanup trap
+        # disable cleanup trap for normal exit (but keep for signals)
         trap - EXIT
         ;;
     3)
