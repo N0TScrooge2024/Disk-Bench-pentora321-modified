@@ -1,6 +1,39 @@
 # Disk-Bench
 🚀 DiskBench - Disk Speed Test Script
 
+Here’s a short summary of the key changes made to the original script:
+
+---
+
+### Summary of Improvements
+
+- **Added safety checks**  
+  - Script now requires root privileges and verifies that all required tools (`dd`, `parted`, `mkfs.ext4`, `wipefs`, `hdparm`, etc.) are present.  
+  - Confirmation prompt before any destructive operation.  
+  - Checks that the selected disk is not mounted, not used as swap, and not open by any process.
+
+- **Reliable partitioning and formatting**  
+  - Uses `wipefs -a` to clean the disk before creating a GPT partition table and a single ext4 partition.  
+  - Correctly detects partition names for both SATA (`sdb1`) and NVMe (`nvme0n1p1`) devices.  
+  - Creates a unique mount point (based on PID) to avoid conflicts.
+
+- **Improved `dd` test**  
+  - Fixed block size to 1 MB (prevents memory allocation issues with large blocks).  
+  - Computes block count from the user‑provided total size in GB.  
+  - Uses `oflag=direct` / `iflag=direct` to bypass the page cache and measure true disk speed.  
+  - Better parsing of speed results from `dd` output.
+
+- **Cleanup and error handling**  
+  - `trap` ensures cleanup (unmount, wipe) even if the script is interrupted.  
+  - Each critical step is checked for success; script exits on failure with clear messages.  
+  - After testing, the disk is wiped and returned to a clean state (no leftover partitions).
+
+- **User interface and clarity**  
+  - All messages and comments are in English.  
+  - Disk list now includes model names for easier identification.  
+  - Clear prompts for test type and total size.
+  
+
 DiskBench is a Bash script for testing the read and write speed of HDD, SSD, and NVMe drives. It utilizes DD and HDParm to measure disk performance.
 ✨ Features:
 
@@ -12,10 +45,11 @@ DiskBench is a Bash script for testing the read and write speed of HDD, SSD, and
 🛠 How to Use
 1️⃣ Download and Run the Script
 
-wget https://codeload.github.com/pentora321/Disk-Bench/zip/refs/heads/main -O disk_bench.sh
+```
+wget {Change later} -O disk_bench.sh
 chmod +x disk_bench.sh
 sudo ./dis_kbench.sh
-
+```
 2️⃣ Manual Execution (Copy & Run Manually)
 
 If you want to run the script manually, follow these steps:
